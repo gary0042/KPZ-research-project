@@ -28,45 +28,44 @@ def _seed_numba_rng(seed: int) -> None:
     np.random.seed(seed)
 
 
-@numba.njit(cache=True)
-def _batch_step_kernel(
-    grid: np.ndarray,
-    occupied_xy: np.ndarray,
-    n_occupied: int,
-    mu: float,
-    L: int,
-    grid_rows: int,
-    time_acc: float,
-    accepted: int,
-    n_steps: int,
-) -> tuple:
-    two_pi = 2.0 * np.pi
-    for _ in range(n_steps):
-        idx = np.random.randint(0, n_occupied)
-        sy = occupied_xy[idx, 0]
-        sx = occupied_xy[idx, 1]
-        pop_id = grid[sy, sx]
+# @numba.njit(cache=True)
+# def _batch_step_kernel(
+#     grid: np.ndarray,
+#     occupied_xy: np.ndarray,
+#     n_occupied: int,
+#     mu: float,
+#     L: int,
+#     grid_rows: int,
+#     time_acc: float,
+#     accepted: int,
+#     n_steps: int,
+# ) -> tuple:
+#     two_pi = 2.0 * np.pi
+#     for _ in range(n_steps):
+#         idx = np.random.randint(0, n_occupied)
+#         sy = occupied_xy[idx, 0]
+#         sx = occupied_xy[idx, 1]
+#         pop_id = grid[sy, sx]
 
-        u = np.random.random()
-        jump = (1.0 - u) ** (-1.0 / mu)
-        theta = two_pi * np.random.random()
-        tx = int(round(sx + jump * np.cos(theta))) % L
-        ty = int(round(sy + jump * np.sin(theta)))
-        time_acc += 1.0 / accepted
+#         u = np.random.random()
+#         jump = (1.0 - u) ** (-1.0 / mu)
+#         theta = two_pi * np.random.random()
+#         tx = int(round(sx + jump * np.cos(theta))) % L
+#         ty = int(round(sy + jump * np.sin(theta)))
+#         time_acc += 1.0 / accepted
 
-        if ty < 0 or ty >= grid_rows:
-            continue
-        if grid[ty, tx] != 0:
-            continue
+#         if ty < 0 or ty >= grid_rows:
+#             continue
+#         if grid[ty, tx] != 0:
+#             continue
 
-        grid[ty, tx] = pop_id
-        occupied_xy[n_occupied, 0] = ty
-        occupied_xy[n_occupied, 1] = tx
-        n_occupied += 1
-        accepted += 1
+#         grid[ty, tx] = pop_id
+#         occupied_xy[n_occupied, 0] = ty
+#         occupied_xy[n_occupied, 1] = tx
+#         n_occupied += 1
+#         accepted += 1
 
-    return n_occupied, time_acc, accepted
-
+#     return n_occupied, time_acc, accepted
 
 @numba.njit(cache=True)
 def _extract_surface_indices_kernel(
@@ -156,6 +155,58 @@ def _sd_width_kernel(
         widths[li] = total_sd / valid if valid > 0 else np.nan
 
     return widths
+
+@numba.njit(cache=True)
+def kernel_vec(
+    grid, occupied_xy, n_occupied, mu, L, grid_rows,
+    time_acc, accepted, u_arr, theta_arr, idx_frac_arr,
+):
+    """Vectorized kernel that performs simulation steps in chunks specified by len(u_arr).
+    see the class method run_chuncked"""
+    n_steps = len(u_arr)
+    for i in range(n_steps):
+        idx    = int(idx_frac_arr[i] * n_occupied)
+        sy     = occupied_xy[idx, 0]
+        sx     = occupied_xy[idx, 1]
+        pop_id = grid[sy, sx]
+
+        jump  = (1.0 - u_arr[i]) ** (-1.0 / mu)
+        theta = theta_arr[i]
+        tx    = int(round(sx + jump * np.cos(theta))) % L
+        ty    = int(round(sy + jump * np.sin(theta)))
+        time_acc += 1.0 / accepted
+
+        if ty < 0 or ty >= grid_rows:
+            continue
+        if grid[ty, tx] != 0:
+            continue
+
+        grid[ty, tx] = pop_id
+        occupied_xy[n_occupied, 0] = ty
+        occupied_xy[n_occupied, 1] = tx
+        n_occupied += 1
+        accepted   += 1
+
+    return n_occupied, time_acc, accepted
+
+def run_chunked(grid, occupied_xy, n_occupied, mu, L, grid_rows,
+            time_acc, accepted, batch, rng, chunk_size=200_000):
+    """Splits up evolution steps from batch in to chunks of 
+    chunk_size, pre-generating random numbers to work with.
+    """
+    remaining = batch
+    while remaining > 0:
+        c         = min(chunk_size, remaining)
+        u_arr     = rng.random(c)
+        theta_arr = rng.random(c) * (2.0 * np.pi)
+        idx_frac  = rng.random(c)
+        n_occupied, time_acc, accepted = kernel_vec(
+            grid, occupied_xy, n_occupied, mu, L, grid_rows,
+            time_acc, accepted, u_arr, theta_arr, idx_frac,
+        )
+        remaining -= c
+    return n_occupied, time_acc, accepted
+
 
 
 # ── JSON helper ──────────────────────────────────────────────────────────────
@@ -356,13 +407,13 @@ class StochasticGrowthStripGeometry:
         ys_idx, _ = np.where(surface > 0)
         return float(np.mean(ys_idx))
 
-    def extract_surface(self) -> np.ndarray:
-        """Legacy boolean-raster surface extractor. Kept for backwards
-        compatibility (notebooks, snapshots). Hot path in run() now uses
-        extract_surface_indices()."""
-        binary = (self.grid > 0)
-        eroded = binary_erosion(binary, border_value=1)
-        return (binary ^ eroded).astype(np.uint8)
+    # def extract_surface(self) -> np.ndarray:
+    #     """Legacy surface extractor. Kept for backwards
+    #     compatibility (notebooks, snapshots). Hot path in run() now uses
+    #     extract_surface_indices()."""
+    #     binary = (self.grid > 0)
+    #     eroded = binary_erosion(binary, border_value=1)
+    #     return (binary ^ eroded).astype(np.uint8)
 
     def extract_surface_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (ys, xs) of surface cells directly, without materialising
@@ -440,17 +491,27 @@ class StochasticGrowthStripGeometry:
 
         start = _time.perf_counter()
         while steps_done < n_steps:
+    
             batch = min(record_interval, n_steps - steps_done)
             print(f"Current progress: {steps_done} of {n_steps} --- {steps_done*100/n_steps:.2f} %", end="\r")
-
-            self.n_occupied, self.time, self.accepted = _batch_step_kernel(
+            
+            # Evolves current simulation forward by steps set by batch.
+            self.n_occupied, self.time, self.accepted = run_chunked( 
                 self.grid, self.occupied_xy, self.n_occupied,
-                self.mu, self.L, grid_rows,
-                self.time, self.accepted, batch,
+                self.mu, self.L, grid_rows, self.time, self.accepted,
+                batch, self.rng
             )
+            
+            # self.n_occupied, self.time, self.accepted = _batch_step_kernel(
+            #     self.grid, self.occupied_xy, self.n_occupied,
+            #     self.mu, self.L, grid_rows,
+            #     self.time, self.accepted, batch,
+            # )
+            
             self.attempts += batch
             steps_done    += batch
 
+            # Record statistics 
             self.history_accepted.append(self.accepted)
             self.history_attempts.append(self.attempts)
             self.history_t.append(self.time)
