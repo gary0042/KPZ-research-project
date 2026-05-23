@@ -1,8 +1,6 @@
 from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
 import time as _time
 
 def fit_loglog_slope(x: np.ndarray, y: np.ndarray) -> float:

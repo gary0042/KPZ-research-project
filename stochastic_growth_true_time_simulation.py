@@ -487,7 +487,10 @@ class StochasticGrowthStripGeometry:
         out_dir      = Path(snapshot_dir) if snapshot_dir else None
         grid_rows    = self.grid.shape[0]
         steps_done   = 0
-        record_interval = round(record_interval_true**2 * self.L / 2)
+        record_interval = int(np.ceil(
+                np.sqrt(2 * self.attempts * self.L) * record_interval_true
+                + record_interval_true**2 * self.L / 2
+            ))
 
         start = _time.perf_counter()
         while steps_done < n_steps:
@@ -542,7 +545,7 @@ class StochasticGrowthStripGeometry:
                     self.save_snapshot(out_dir, self.attempts, save_png=True)
         end = _time.perf_counter()
         elapsed = end - start
-        print(f"Elapsed time: {(elapsed):.6f} seconds")
+        print(f"Elapsed time: {(elapsed):.6f} seconds\n")
 
 
         return self.get_obs()
