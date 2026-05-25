@@ -477,7 +477,8 @@ class StochasticGrowthStripGeometry:
             ls: list = [],
             snapshot_steps: Optional[Iterable[int]] = None,
             snapshot_dir: Optional[str] = None,
-            save_snapshots: bool = False):
+            save_snapshots: bool = False,
+            verbose: bool = False):
         if not self.ls:
             if not ls:
                 raise ValueError("ls has not been specified. Pass ls= to run() or set sim.ls.")
@@ -487,16 +488,14 @@ class StochasticGrowthStripGeometry:
         out_dir      = Path(snapshot_dir) if snapshot_dir else None
         grid_rows    = self.grid.shape[0]
         steps_done   = 0
-        record_interval = int(np.ceil(
-                np.sqrt(2 * self.attempts * self.L) * record_interval_true
-                + record_interval_true**2 * self.L / 2
-            ))
+        record_interval = round(record_interval_true**2 * self.L / 2)
 
         start = _time.perf_counter()
         while steps_done < n_steps:
     
             batch = min(record_interval, n_steps - steps_done)
-            print(f"Current progress: {steps_done} of {n_steps} --- {steps_done*100/n_steps:.2f} %", end="\r")
+            if verbose:
+                print(f"Current progress: {steps_done} of {n_steps} --- {steps_done*100/n_steps:.2f} %", end="\r")
             
             # Evolves current simulation forward by steps set by batch.
             self.n_occupied, self.time, self.accepted = run_chunked( 
@@ -521,7 +520,7 @@ class StochasticGrowthStripGeometry:
             max_h = self.max_interface_height()
             self.history_max_height.append(max_h)
             if max_h > 0.67 * self.grid.shape[0]:
-                print(f"Lattice height doubled. Previous {self.grid.shape[0]}. Max interface height: {max_h}.")
+                print(f"Lattice height doubled. Previous {self.grid.shape[0]}. Max interface height: {max_h}.\n")
                 self._expand_grid()
                 grid_rows = self.grid.shape[0]
 
@@ -545,7 +544,8 @@ class StochasticGrowthStripGeometry:
                     self.save_snapshot(out_dir, self.attempts, save_png=True)
         end = _time.perf_counter()
         elapsed = end - start
-        print(f"Elapsed time: {(elapsed):.6f} seconds\n")
+        if verbose:
+            print(f"Elapsed time: {(elapsed):.6f} seconds\n")
 
 
         return self.get_obs()

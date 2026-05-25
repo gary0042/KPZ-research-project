@@ -35,7 +35,7 @@ mu_values = [5.0]
 # n_steps and record_interval_true are paired; walltime applies per
 # (L, n_steps, record_interval_true) combination.
 step_configs = [
-    (int(5e8), 3, "06:00:00"),
+    (int(5e8), 5, "06:00:00"),
 ]
 
 # Number of replicates per configuration
@@ -44,7 +44,9 @@ N_replicates = 50
 # Seeds: range(seed_start, seed_start + N_replicates)
 seed_start = 1
 
-# Parallel workers per job; SLURM --cpus-per-task = max_workers + 5
+# Parallel workers per job; SLURM --cpus-per-task = 2*(max_workers + 5)
+# Doubling because each physical core has 2 threads (logical cpus) 
+# If we truly want max_worker number of cores we have to double what we request.
 max_workers = 50
 
 # Root directory for ensemble output on the cluster.
@@ -63,7 +65,7 @@ slurm_account    = "m3152"
 slurm_queue      = "regular"
 slurm_constraint = "cpu"
 slurm_nodes      = 1
-conda_env        = "py311-stoch_surf_growth"
+conda_env        = "py313-ssg"
 email            = "gary_han@berkeley.edu"
 
 # =====================================================================
@@ -80,9 +82,45 @@ import os
 import time
 import json as _json
 import multiprocessing as _mp
+import zipfile
+import contextlib, io
 from stochastic_growth_true_time_simulation import *
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+
+def _atomic_sim_save(sim, save_path):
+    """Save sim such that an interrupted save cannot corrupt the final files.
+
+    Writes to a temp path then atomically renames into place via os.replace.
+    The trailing "." on tmp_base is intentional: it keeps Path.with_suffix('')
+    a no-op inside sim.save(), so sim.save writes <tmp_base>.npz/.json rather
+    than stripping ".tmp" and overwriting the real target directly.
+    """
+    tmp_base = f"{save_path}.tmp."
+    with contextlib.redirect_stdout(io.StringIO()):
+        sim.save(tmp_base)
+    os.replace(f"{tmp_base}.npz",  f"{save_path}.npz")
+    os.replace(f"{tmp_base}.json", f"{save_path}.json")
+    print(f"Simulation saved (atomic) to {save_path}.npz/.json "
+          f"(t={sim.time:.4f}, accepted={sim.accepted})")
+
+
+def _is_valid_replica(base) -> bool:
+    """Return True iff <base>.npz and <base>.json both exist and look intact."""
+    base = Path(base)
+    npz = base.with_suffix(".npz")
+    js  = base.with_suffix(".json")
+    if not (npz.exists() and js.exists()):
+        return False
+    if not zipfile.is_zipfile(npz):
+        return False
+    try:
+        with open(js) as f:
+            _json.load(f)
+    except Exception:
+        return False
+    return True
 
 
 def _replica_filename(seed: int) -> str:
@@ -91,7 +129,7 @@ def _replica_filename(seed: int) -> str:
 
 def _run_replica(L, mu, seed, n_steps, record_interval_true, ls, ensemble_dir,
                  save_every_seconds=1800, chunk_steps=100_000_000):
-    """Worker: build one sim, run it in chunks, periodically save."""
+    """Worker: build one sim, run it in chunks, periodically save (atomic)."""
     ensemble_dir = Path(ensemble_dir)
     ensemble_dir.mkdir(parents=True, exist_ok=True)
     save_path = str(ensemble_dir / _replica_filename(seed))
@@ -106,10 +144,10 @@ def _run_replica(L, mu, seed, n_steps, record_interval_true, ls, ensemble_dir,
         sim.run(n_steps=step, record_interval_true=record_interval_true)
         remaining -= step
         if time.monotonic() - last_save >= save_every_seconds:
-            sim.save(save_path)
+            _atomic_sim_save(sim, save_path)
             last_save = time.monotonic()
 
-    sim.save(save_path)
+    _atomic_sim_save(sim, save_path)
     return save_path
 
 
@@ -123,9 +161,9 @@ def _run_loaded_replica(sim, seed, n_steps, record_interval_true, ensemble_dir,
         sim.run(n_steps=step, record_interval_true=record_interval_true)
         remaining -= step
         if time.monotonic() - last_save >= save_every_seconds:
-            sim.save(save_path)
+            _atomic_sim_save(sim, save_path)
             last_save = time.monotonic()
-    sim.save(save_path)
+    _atomic_sim_save(sim, save_path)
     return save_path
 
 
@@ -188,12 +226,62 @@ def batch_load(ensemble_dir):
     replicas = {}
     for npz_path in sorted(ensemble_dir.glob("replica_seed*.npz")):
         base = npz_path.with_suffix("")
-        if not (base.with_suffix(".json")).exists():
-            print(f"[skip] {npz_path.name} has no matching .json")
+        if not _is_valid_replica(base):
+            print(f"[skip] {npz_path.name} is corrupt or missing pair")
             continue
         seed = int(base.name.split("seed")[-1])
         replicas[seed] = StochasticGrowthStripGeometry.load(str(base))
     return replicas, meta
+
+
+def batch_respawn(ensemble_dir, max_workers=10):
+    """Re-run any seed whose replica file is missing or corrupt.
+
+    Seeds and parameters are taken from ensemble_meta.json. New replicas
+    are written into ensemble_dir, overwriting any corrupt files in place.
+    """
+    ensemble_dir = Path(ensemble_dir)
+    meta_path = ensemble_dir / "ensemble_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"No ensemble_meta.json in {ensemble_dir}")
+    with open(meta_path) as f:
+        meta = _json.load(f)
+
+    L                    = meta["L"]
+    mu                   = meta["mu"]
+    n_steps              = meta["n_steps"]
+    record_interval_true = meta["record_interval_true"]
+    ls                   = meta["ls"]
+    all_seeds            = meta["seeds"]
+
+    bad_seeds = [
+        s for s in all_seeds
+        if not _is_valid_replica(ensemble_dir / _replica_filename(s))
+    ]
+    if not bad_seeds:
+        print("All replicas valid; nothing to respawn.")
+        return
+    print(f"Respawning {len(bad_seeds)} seed(s): {bad_seeds}")
+
+    if max_workers is None:
+        max_workers = os.cpu_count() or 1
+    max_workers = min(max_workers, len(bad_seeds))
+    ctx = _mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        futures = {
+            ex.submit(
+                _run_replica, L, mu, int(seed),
+                n_steps, record_interval_true, ls, str(ensemble_dir),
+            ): int(seed)
+            for seed in bad_seeds
+        }
+        for fut in as_completed(futures):
+            seed = futures[fut]
+            try:
+                path = fut.result()
+                print(f"[seed {seed:06d}] respawned → {path}")
+            except Exception as e:
+                print(f"[seed {seed:06d}] FAILED: {e!r}")
 
 
 def batch_complete(ensemble_dir, max_workers=10):
@@ -328,7 +416,8 @@ def _make_main_block(
         "",
         "",
         "if __name__ == '__main__':",
-        "    resume = False",
+        "    complete = False",
+        "    respawn  = False",
         f"    L = {L}",
         f"    mu = {mu}",
         f"    seeds = list(range({seed_start}, {seed_end}))",
@@ -337,10 +426,18 @@ def _make_main_block(
         f"    max_workers = {max_workers}",
         f"    root_dir = {root_dir_expr}",
         f"    ls = {ls_repr}",
-        "    if resume:",
-        "        ensemble_dir = None  # set to your ensemble directory",
-        "        print(f'Resuming from {ensemble_dir}')",
-        "        batch_resume(ensemble_dir, n_steps, record_interval_true, max_workers=max_workers)",
+        "    if complete or respawn:",
+        "        _L_tag  = f'{L}'",
+        "        _mu_tag = f'{float(mu):.2f}'.replace('.', 'p')",
+        "        _t_tag  = f'{n_steps // 1_000_000}M'",
+        "        _N_tag  = f'{len(seeds)}'",
+        "        ensemble_dir = root_dir / f'ensemble_L{_L_tag}_mu{_mu_tag}_t{_t_tag}_dtau{record_interval_true}_N{_N_tag}'",
+        "    if complete:",
+        "        print(f'Completing from {ensemble_dir}')",
+        "        batch_complete(ensemble_dir, max_workers=max_workers)",
+        "    elif respawn:",
+        "        print(f'Respawning bad seeds from {ensemble_dir}')",
+        "        batch_respawn(ensemble_dir, max_workers=max_workers)",
         "    else:",
         "        print(f'Current job: L = {L}, mu = {mu}, "
         "n_steps = {n_steps // 1_000_000}M, record_interval = {record_interval_true}')",
@@ -358,7 +455,7 @@ def _make_slurm_script(job_name, walltime, script_nersc_path, cpus_per_task) -> 
 #SBATCH -C {slurm_constraint}
 #SBATCH -N {slurm_nodes}
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --cpus-per-task={cpus_per_task * 2}
 #SBATCH -t {walltime}
 #SBATCH -J {job_name}
 #SBATCH -o logs/%x-%j.out
