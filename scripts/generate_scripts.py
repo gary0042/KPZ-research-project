@@ -29,17 +29,17 @@ L_values = [2**14]
 ls_expr = "list(np.logspace(7, 13, num=100, base=2, dtype=int))"
 
 # mu values to sweep over
-mu_values = [5.0]
+mu_values = [3.5,4.0,4.5,5.0,5.5,6.0]
 
 # (n_steps, record_interval_true, SLURM walltime "hh:mm:ss") triplets.
 # n_steps and record_interval_true are paired; walltime applies per
 # (L, n_steps, record_interval_true) combination.
 step_configs = [
-    (int(5e8), 5, "06:00:00"),
+    (int(3*(10**12)), 5, "08:00:00"),
 ]
 
 # Number of replicates per configuration
-N_replicates = 50
+N_replicates = 100
 
 # Seeds: range(seed_start, seed_start + N_replicates)
 seed_start = 1
@@ -47,7 +47,7 @@ seed_start = 1
 # Parallel workers per job; SLURM --cpus-per-task = 2*(max_workers + 5)
 # Doubling because each physical core has 2 threads (logical cpus) 
 # If we truly want max_worker number of cores we have to double what we request.
-max_workers = 50
+max_workers = 100
 
 # Root directory for ensemble output on the cluster.
 # Any valid Python expression; Path and os are available in generated scripts.
