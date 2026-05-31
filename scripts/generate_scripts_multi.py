@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Script generator for KPZ stochastic growth NERSC batch jobs.
+Script generator for KPZ stochastic growth NERSC batch jobs (multi-task variant).
+
+Same generated Python scripts as generate_scripts.py, but each SLURM batch
+script bundles TASKS_PER_NODE (default 3) Python jobs and runs them
+concurrently on a single node using srun --exact job steps.
 
 Edit the USER CONFIGURATION block, then run:
-    python generate_scripts.py
-
-For each (L, mu, n_steps, record_interval_true) combination, writes to
-output_dir/:
-  run_<name>.py       self-contained Python simulation script
-  submit_<name>.sh    SLURM batch submission script
-  submit_all.sh       master script to sbatch every generated job
+    python generate_scripts_multi.py
 """
 
 from pathlib import Path
@@ -36,7 +34,7 @@ mu_values = [3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9,
 # n_steps and record_interval_true are paired; walltime applies per
 # (L, n_steps, record_interval_true) combination.
 step_configs = [
-    (int(124_000 * 1_000_000_000), 5, "04:00:00"),
+    (int(124_000 * 1_000_000), 3, "04:30:00"),
 ]
 
 # Number of replicates per configuration
@@ -45,14 +43,13 @@ N_replicates = 80
 # Seeds: range(seed_start, seed_start + N_replicates)
 seed_start = 1
 
-# Parallel workers per job; SLURM --cpus-per-task = 2*(max_workers + 5)
-# Doubling because each physical core has 2 threads (logical cpus) 
-# If we truly want max_worker number of cores we have to double what we request.
+# Parallel workers per Python job; each task in the bundle gets assigned a logical CPU
 max_workers = 80
 
+# Number of Python jobs bundled into a single SLURM script / node.
+TASKS_PER_NODE = 3
+
 # Root directory for ensemble output on the cluster.
-# Any valid Python expression; Path and os are available in generated scripts.
-# Typical NERSC value: Path(os.environ["PSCRATCH"])
 root_dir_expr = 'Path(os.environ["PSCRATCH"])'
 
 # Local directory where generated scripts are written
@@ -76,6 +73,7 @@ email            = "gary_han@berkeley.edu"
 
 # ---------------------------------------------------------------------------
 # Helper functions embedded verbatim in every generated Python script.
+# (Identical to generate_scripts.py — the generated .py is unchanged.)
 # ---------------------------------------------------------------------------
 
 _HELPERS = '''\
@@ -129,7 +127,7 @@ def _replica_filename(seed: int) -> str:
 
 
 def _run_replica(L, mu, seed, n_steps, record_interval_true, ls, ensemble_dir,
-                 save_every_seconds=1800, chunk_steps=100_000_000):
+                 save_every_seconds=15_600, chunk_steps=100*100_000_000):
     """Worker: build one sim, run it in chunks, periodically save (atomic)."""
     ensemble_dir = Path(ensemble_dir)
     ensemble_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +140,7 @@ def _run_replica(L, mu, seed, n_steps, record_interval_true, ls, ensemble_dir,
     last_save = time.monotonic()
     while remaining > 0:
         step = min(chunk_steps, remaining)
+        print(f"Remaining {remaining/n_steps}", end='\r')
         sim.run(n_steps=step, record_interval_true=record_interval_true)
         remaining -= step
         if time.monotonic() - last_save >= save_every_seconds:
@@ -153,12 +152,13 @@ def _run_replica(L, mu, seed, n_steps, record_interval_true, ls, ensemble_dir,
 
 
 def _run_loaded_replica(sim, seed, n_steps, record_interval_true, ensemble_dir,
-                        save_every_seconds=1800, chunk_steps=100_000_000):
+                        save_every_seconds=1800, chunk_steps=100*100_000_000):
     save_path = str(Path(ensemble_dir) / _replica_filename(seed))
     remaining = n_steps
     last_save = time.monotonic()
     while remaining > 0:
         step = min(chunk_steps, remaining)
+        print(f"Remaining {remaining/n_steps}", end='\r')
         sim.run(n_steps=step, record_interval_true=record_interval_true)
         remaining -= step
         if time.monotonic() - last_save >= save_every_seconds:
@@ -448,15 +448,29 @@ def _make_main_block(
     return "\n".join(lines)
 
 
-def _make_slurm_script(job_name, walltime, script_nersc_path, cpus_per_task) -> str:
+def _make_bundled_slurm_script(
+    job_name, walltime, py_nersc_paths, cpus_per_task, tasks_per_node,
+) -> str:
+    """SLURM script that launches `tasks_per_node` python jobs concurrently
+    on one node as separate srun job steps sharing the allocation via
+    `--exact`. Each step gets `cpus_per_task` logical CPUs."""
+    srun_lines = []
+    for i, p in enumerate(py_nersc_paths):
+        srun_lines.append(
+            f'srun --exact -N 1 -n 1 -c {cpus_per_task} '
+            f'-o logs/%x-%j.task{i}.out -e logs/%x-%j.task{i}.err '
+            f'python {p} &'
+        )
+    srun_block = "\n".join(srun_lines)
+
     return f"""\
 #!/bin/bash
 #SBATCH -A {slurm_account}
 #SBATCH -q {slurm_queue}
 #SBATCH -C {slurm_constraint}
 #SBATCH -N {slurm_nodes}
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task={cpus_per_task * 2}
+#SBATCH --ntasks-per-node={tasks_per_node}
+#SBATCH --cpus-per-task={cpus_per_task}
 #SBATCH -t {walltime}
 #SBATCH -J {job_name}
 #SBATCH -o logs/%x-%j.out
@@ -465,11 +479,12 @@ def _make_slurm_script(job_name, walltime, script_nersc_path, cpus_per_task) -> 
 #SBATCH --mail-user={email}
 
 set -euo pipefail
-echo "Starting job ${{SLURM_JOB_NAME}} (ID: ${{SLURM_JOB_ID}}) on host $(hostname)"
+echo "Starting bundled job ${{SLURM_JOB_NAME}} (ID: ${{SLURM_JOB_ID}}) on host $(hostname)"
 echo "Running in directory: ${{PWD}}"
 echo "SLURM_NODELIST: ${{SLURM_NODELIST}}"
 echo "SLURM_NTASKS:   ${{SLURM_NTASKS}}"
 echo "CPUS per task:  ${{SLURM_CPUS_PER_TASK}}"
+echo "Tasks bundled:  {tasks_per_node}"
 
 date
 
@@ -483,31 +498,40 @@ echo "Using Python: $(which python)"
 python --version
 
 mkdir -p logs
-srun -n 1 -c ${{SLURM_CPUS_PER_TASK}} python {script_nersc_path}
 
-echo "Job completed at:"
+# Launch all bundled python jobs concurrently as separate srun steps
+# sharing the single-node allocation. `--exact` is required so steps
+# do not each try to grab the full allocation.
+{srun_block}
+
+wait
+
+echo "All bundled tasks finished at:"
 date
 """
 
 
+def _chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
 def main():
     ls_values = [int(x) for x in eval(ls_expr, {"np": np})]
-    cpus_per_task = max_workers + 5
+    # Each python job's internal pool gets max_workers; SLURM allocation
+    # per task mirrors the logic in generate_scripts.py: 2*(max_workers+5).
+    cpus_per_task = (max_workers + 2)
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    slurm_names = []
-    total = len(L_values) * len(mu_values) * len(step_configs)
-    print(f"Generating {total} job pair(s) → '{output_dir}/'")
-    print()
-
+    # Build the flat list of (job_name, py_filename, walltime) entries.
+    jobs = []
     for L in L_values:
         for mu in mu_values:
             for n_steps, record_interval_true, walltime in step_configs:
                 name    = _job_name(L, mu, n_steps, record_interval_true, N_replicates)
                 py_name = f"run_{name}.py"
-                sh_name = f"submit_{name}.sh"
 
                 py_content = _HELPERS + _make_main_block(
                     L, mu, n_steps, record_interval_true,
@@ -515,21 +539,44 @@ def main():
                     root_dir_expr,
                 )
                 (out / py_name).write_text(py_content)
+                jobs.append((name, py_name, walltime))
 
-                sh_content = _make_slurm_script(
-                    job_name=name,
-                    walltime=walltime,
-                    script_nersc_path=f"{nersc_base}/{py_name}",
-                    cpus_per_task=cpus_per_task,
-                )
-                sh_path = out / sh_name
-                sh_path.write_text(sh_content)
-                sh_path.chmod(0o755)
+    total_py = len(jobs)
+    bundles = list(_chunked(jobs, TASKS_PER_NODE))
+    print(f"Generated {total_py} python script(s), bundled into "
+          f"{len(bundles)} SLURM script(s) at {TASKS_PER_NODE}/node → '{output_dir}/'")
+    print()
 
-                slurm_names.append(sh_name)
-                print(f"  {py_name}")
-                print(f"  {sh_name}  (walltime={walltime}, cpus={cpus_per_task})")
-                print()
+    slurm_names = []
+    for bi, bundle in enumerate(bundles):
+        # Bundle's walltime = max of constituent walltimes.
+        bundle_walltime = max(w for _, _, w in bundle)
+        first_name = bundle[0][0]
+        last_name  = bundle[-1][0]
+        if len(bundle) == 1:
+            bundle_name = f"bundle{bi:03d}_{first_name}"
+        else:
+            bundle_name = f"bundle{bi:03d}_x{len(bundle)}_{first_name}"
+        sh_name = f"submit_{bundle_name}.sh"
+
+        py_nersc_paths = [f"{nersc_base}/{pyn}" for _, pyn, _ in bundle]
+        sh_content = _make_bundled_slurm_script(
+            job_name=bundle_name,
+            walltime=bundle_walltime,
+            py_nersc_paths=py_nersc_paths,
+            cpus_per_task=cpus_per_task,
+            tasks_per_node=len(bundle),
+        )
+        sh_path = out / sh_name
+        sh_path.write_text(sh_content)
+        sh_path.chmod(0o755)
+        slurm_names.append(sh_name)
+
+        print(f"  {sh_name}  (walltime={bundle_walltime}, "
+              f"cpus_per_task={cpus_per_task}, tasks={len(bundle)})")
+        for _, pyn, _ in bundle:
+            print(f"      └─ {pyn}")
+        print()
 
     master = out / "submit_all.sh"
     master.write_text("#!/bin/bash\n\n" + "".join(f"sbatch {s}\n" for s in slurm_names))
